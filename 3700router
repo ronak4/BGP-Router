@@ -1,0 +1,419 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse
+import json
+import select
+import socket
+
+# A simple BGP Router
+class Router:
+    relations = {}
+    sockets = {}
+    ports = {}
+    table = []
+    withdrawn_routes = []
+    route_announcements = []
+
+    def __init__(self, asn, connections):
+        print("Router at AS %s starting up" % asn)
+        self.asn = asn
+        for relationship in connections:
+            port, neighbor, relation = relationship.split("-")
+
+            self.sockets[neighbor] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sockets[neighbor].bind(('localhost', 0))
+            self.ports[neighbor] = int(port)
+            self.relations[neighbor] = relation
+            self.send(neighbor,
+                      json.dumps({"type": "handshake", "src": self.our_addr(neighbor), "dst": neighbor, "msg": {}}))
+
+    def our_addr(self, dst):
+        quads = list(int(qdn) for qdn in dst.split('.'))
+        quads[3] = 1
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+
+    """
+    Calculate the peer's IP address based on a given address.
+
+    :param addr: The given IP address to calculate from.
+    :return: Calculated peer IP address.
+    """
+    def peer_addr(self, addr):
+        quads = list(int(qdn) for qdn in addr.split('.'))
+        quads[3] = 2
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+
+    """
+    Aggregate routes in the routing table where possible.
+    """
+    def aggregate_routes(self):
+        self.table.sort(key=lambda x: (x['network'], x['netmask']))
+        i = 0
+        while i < len(self.table) - 1:
+            curr_route = self.table[i]
+            next_route = self.table[i + 1]
+            if self.are_adjacent_and_compatible(curr_route, next_route):
+                aggregated_route = self.aggregate(curr_route)
+                self.table[i] = aggregated_route
+                self.table.pop(i + 1)
+            else:
+                i += 1
+
+    """
+    Convert a netmask from dotted decimal to CIDR notation.
+
+    :param netmask: Netmask in dotted decimal format.
+    :return: Netmask in CIDR notation.
+    """
+    def netmask_to_cidr(self, netmask):
+        if '/' in netmask:
+            return int(netmask.split('/')[-1])
+        else:
+            return sum([bin(int(x)).count('1') for x in netmask.split('.')])
+
+    """
+    Convert a CIDR prefix to a dotted decimal netmask.
+
+    :param cidr: CIDR prefix.
+    :return: Netmask in dotted decimal format.
+    """
+    def cidr_to_netmask(self, cidr):
+        cidr = int(cidr)
+        mask_bin = '1' * cidr + '0' * (32 - cidr)
+        netmask = '.'.join(str(int(mask_bin[i:i + 8], 2)) for i in range(0, 32, 8))
+        return netmask
+
+    """
+    Check if two routes are adjacent and have compatible attributes for aggregation.
+
+    :param route1: First route.
+    :param route2: Second route.
+    :return: True if routes are adjacent and compatible, False otherwise.
+    """
+    def are_adjacent_and_compatible(self, route1, route2):
+        cidr1 = self.netmask_to_cidr(route1['netmask'])
+        cidr2 = self.netmask_to_cidr(route2['netmask'])
+        if cidr1 == cidr2:
+            ip_int1 = self.ip_to_int(route1['network'])
+            ip_int2 = self.ip_to_int(route2['network'])
+            expected_diff = 2 ** (32 - cidr1)
+            adjacent = abs(ip_int1 - ip_int2) == expected_diff
+            compatible = self.same_attributes(route1, route2)
+            return adjacent and compatible
+        else:
+            return False
+
+    """
+    Check if two routes have the same attributes.
+
+    :param route1: First route.
+    :param route2: Second route.
+    :return: True if attributes match, False otherwise.
+    """
+    def same_attributes(self, route1, route2):
+        return (route1['peer'] == route2['peer'] and route1['localpref'] == route2['localpref'] and
+                route1['origin'] == route2['origin'] and route1['selfOrigin'] == route2['selfOrigin'] and
+                route1['ASPath'] == route2['ASPath'])
+
+    """
+    Perform the aggregation of two routes.
+
+    :param route1: The base route for aggregation.
+    :return: The aggregated route.
+    """
+    def aggregate(self, route1):
+        mask1_cidr = self.netmask_to_cidr(route1['netmask'])
+        new_netmask = self.cidr_to_netmask(mask1_cidr - 1)
+        new_network = route1['network']
+        return {**route1, 'network': new_network, 'netmask': new_netmask}
+
+    """
+    Disaggregate the routing table by clearing the table, adding all of the routes back, then 
+    removing routes that have been withdrawn. 
+    """
+    def disaggregate_routes(self):
+        self.table.clear()
+        for route in self.route_announcements:
+            self.handle_update(route, False)
+        for withdraw in self.withdrawn_routes:
+            src = withdraw['src']
+            self.handle_withdraw(withdraw, src, False)
+
+    """
+    Handles an update message from a neighbor by adding it to the routing table and sending a 
+    copy of the message to the other neighbors. 
+
+    :param message: The update message containing route information.
+    :param aggregate: True if aggregation should be performed after adding the route to 
+                      the routing table, False if aggregation should not be performed. 
+    """
+    def handle_update(self, message, aggregate):
+        # print("HANDLING UPDATE ON LINE 33....HANDLING UPDATE ON LINE 33 \n")
+        # print(message)
+        msg = message['msg']
+        network = msg['network']
+        netmask = msg['netmask']
+        localpref = msg['localpref']
+        selfOrigin = msg['selfOrigin']
+        ASPath = msg['ASPath']
+        origin = msg['origin']
+        peer = self.peer_addr(message['src'])
+
+        # print("before insertion")
+        # print(self.rTable)
+        # print("\n")
+        self.table.append(
+            {"network": network, "netmask": netmask, "peer": peer, "localpref": localpref, "ASPath": ASPath,
+             "selfOrigin": selfOrigin, "origin": origin})
+        if aggregate:
+            self.aggregate_routes()
+            self.route_announcements.append(message)
+            updated_ASPath = [self.asn]
+            updated_ASPath.extend(ASPath)
+            new_message = {"network": network, "netmask": netmask, "ASPath": updated_ASPath}
+            self.send_copy_to_neighbours(message['type'], peer, new_message)
+
+        # print("ROUTING TABLE \n")
+        # print(self.table)
+
+    """
+    Handles a withdraw message from a neighbor by removing the specified route from the routing table
+    and sending a copy of the message to the other neighbors. 
+
+    :param message: The withdraw message containing route information to be removed.
+    :param srcif: The address of the neighbor that sent the message.
+    :param withdraw: True if disaggregation should be performed before removing the route from 
+                      the routing table, False if disaggregation should not be performed. 
+    """
+    def handle_withdraw(self, message, srcif, withdraw):
+        msg = message['msg']
+        peer = self.peer_addr(message['src'])
+        if withdraw:
+            self.disaggregate_routes()
+
+        for route in msg:
+            for entry in self.table:
+                if (entry['network'] == route['network'] and entry['netmask'] == route['netmask'] and
+                        entry['peer'] == srcif):
+                    self.table.remove(entry)
+
+        # print("removed route")
+        #  print(self.table)
+        if withdraw:
+            self.send_copy_to_neighbours(message['type'], peer, msg)
+            self.withdrawn_routes.append(message)
+            self.aggregate_routes()
+
+    """
+    Forwards a message to all neighbors except the source of the message.
+
+    :param msg_type: The type of message to forward.
+    :param peer: The original sender of the message to avoid sending back to.
+    :param msg: The message content to forward.
+    """
+    def send_copy_to_neighbours(self, msg_type, peer, msg):
+        for neighbor in self.sockets:
+            if neighbor != peer:
+                if self.relations[peer] == "cust" or (
+                        self.relations[peer] != "cust" and self.relations[neighbor] == "cust"):
+                    print("sending to neighbor")
+                    self.send(neighbor, json.dumps(
+                        {"type": msg_type, "src": self.our_addr(neighbor), "dst": neighbor, "msg": msg}))
+
+    """
+    Handles incoming data messages by looking up the best matching route for the destination
+    address contained in the message. If a match is found, it's forwarded to the appropriate peer.
+    Otherwise, it responds with a "no route found" message back to the source.
+
+    :param message: The data message to be forwarded. 
+    :param srcif: The address of the neighbor that sent the message.
+    """
+    def handle_data(self, message, srcif):
+        src = message['src']
+        dst = message['dst']
+
+        best = None
+        longest = 0
+
+        for entry in self.table:
+            network = entry['network']
+            netmask = entry['netmask']
+            if network == dst:
+                best = entry
+                break
+            matched, count = self.prefix_match(dst, network, netmask)
+            if matched:
+                if best is None or count > longest:
+                    best = entry
+                    longest = count
+                elif count == longest:
+                    best = self.get_best_entry(best, entry)
+
+        if best is None:
+            msg = {'src': self.our_addr(src), 'dst': srcif, 'type': "no route", 'msg': {}}
+            print("no route found")
+            self.send(srcif, json.dumps(msg))
+        else:
+            dst_peer = best['peer']
+            if self.relations[srcif] == 'cust' or self.relations[dst_peer] == 'cust':
+                self.send(dst_peer, json.dumps(message))
+
+    """
+    Determines if a given destination IP address matches a network prefix defined by a network address
+    and a netmask.
+
+    :param dst: The destination IP address in dotted decimal format.
+    :param network_address: The network address defining the prefix to match against, in dotted decimal format.
+    :param netmask: The netmask associated with the network prefix.
+    :return: A tuple (matched, count) where 'matched' is a boolean indicating whether the destination IP
+             matches the network prefix, and 'count' is the number of leading bits in the netmask that matched.
+    """
+    def prefix_match(self, dst, network_address, netmask):
+        ip_bin = ''.join(format(int(x), '08b') for x in dst.split('.'))
+        net_bin = ''.join(format(int(x), '08b') for x in network_address.split('.'))
+
+        if '/' in netmask:
+            cidr = int(netmask.split('/')[-1])
+            mask_bin = '1' * cidr + '0' * (32 - cidr)
+        else:
+            mask_bin = ''.join(format(int(x), '08b') for x in netmask.split('.'))
+
+        matched = True
+        count = 0
+        for i in range(32):
+            if mask_bin[i] == '1':
+                if ip_bin[i] != net_bin[i]:
+                    matched = False
+                    break
+                count += 1
+
+        return matched, count
+
+    """
+    Compares two routing entries based on the following rules and returns the 'best' entry:
+    1. The entry with the highest localpref wins. If the localprefs are equal…
+    2. The entry with selfOrigin as true wins. If all selfOrigins are the equal…
+    3. The entry with the shortest ASPath wins. If multiple entries have the shortest length…
+    4. The entry with the best origin wins, where IGP > EGP > UNK. If multiple entries have the best origin…
+    5. The entry from the neighbor router (i.e., the src of the update message) with the lowest IP address.
+
+    :param e1: The first route entry.
+    :param e2: The second route entry.
+    :return: The 'best' route between the two provided based on the rules.
+    """
+    def get_best_entry(self, e1, e2):
+        # print("GET BEST")
+        # print(e1)
+        # print(e2)
+        if e1['localpref'] > e2['localpref']:
+            return e1
+        elif e2['localpref'] > e1['localpref']:
+            return e2
+        elif e1['selfOrigin'] and not e2['selfOrigin']:
+            return e1
+        elif not e1['selfOrigin'] and e2['selfOrigin']:
+            return e2
+        elif len(e1['ASPath']) < len(e2['ASPath']):
+            return e1
+        elif len(e1['ASPath']) > len(e2['ASPath']):
+            return e2
+        elif e1['origin'] != e2['origin']:
+            return self.best_origin(e1, e2)
+        elif e1['peer'] != e2['peer']:
+            return self.lowest_ip(e1, e2)
+        else:
+            return None
+
+    """
+    Determines the preferred route based on the origin type, where IGP > EGP > UNK.
+
+    :param e1: The first route entry.
+    :param e2: The second route entry.
+    :return: The route that is considered to have the best origin according to BGP preferences.
+    """
+    def best_origin(self, e1, e2):
+        o1 = e1['origin']
+        o2 = e2['origin']
+        if o1 == "IGP" and o2 != "IGP":
+            return e1
+        elif o2 == "IGP" and o1 != "IGP":
+            return e2
+        elif o1 == "EGP" and o2 != "EGP":
+            return e1
+        elif o2 == "EGP" and o1 != "EGP":
+            return e2
+
+    """
+    Compares two routes based on the numerical value of their peer IP addresses and returns the route
+    with the lower IP address. 
+
+    :param e1: The first route entry.
+    :param e2: The second route entry.
+    :return: The route whose 'peer' IP address has the lower numerical value.
+    """
+    def lowest_ip(self, e1, e2):
+        ip1 = self.ip_to_int(e1['peer'])
+        ip2 = self.ip_to_int(e2['peer'])
+
+        if ip1 < ip2:
+            return e1
+        else:
+            return e2
+
+    """
+    Converts an IP address from dotted decimal format to an integer.
+
+    :param ip_address: The IP address in dotted decimal format.
+    :return: The numeric representation of the IP address.
+    """
+    def ip_to_int(self, ip):
+        quad = ip.split('.')
+        return int(quad[0]) * 256 ** 3 + int(quad[1]) * 256 ** 2 + int(quad[2]) * 256 + int(quad[3])
+
+    """
+    Handles a dump request, sending the current routing table to the requester.
+
+    :param message: The dump request message.
+    :param srcif: The source interface or neighbor from which the dump request was received.
+    """
+    def handle_dump(self, message):
+        src = message['src']
+        self.send(src, json.dumps({'src': self.our_addr(src), 'dst': src, 'type': "table", 'msg': self.table}))
+
+    def send(self, network, message):
+        self.sockets[network].sendto(message.encode('utf-8'), ('localhost', self.ports[network]))
+
+    def run(self):
+        while True:
+            socks = select.select(self.sockets.values(), [], [], 0.1)[0]
+            for conn in socks:
+                k, addr = conn.recvfrom(65535)
+                srcif = None
+                for sock in self.sockets:
+                    if self.sockets[sock] == conn:
+                        srcif = sock
+                        break
+                msg = k.decode('utf-8')
+
+                print("Received message '%s' from %s" % (msg, srcif))
+                data = json.loads(msg)
+
+                tp = data['type']
+
+                if tp == 'update':
+                    self.handle_update(data, True)
+                elif tp == 'data':
+                    self.handle_data(data, srcif)
+                elif tp == 'withdraw':
+                    self.handle_withdraw(data, srcif, True)
+                elif tp == 'dump':
+                    self.handle_dump(data)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='route packets')
+    parser.add_argument('asn', type=int, help="AS number of this router")
+    parser.add_argument('connections', metavar='connections', type=str, nargs='+', help="connections")
+    args = parser.parse_args()
+    router = Router(args.asn, args.connections)
+    router.run()
